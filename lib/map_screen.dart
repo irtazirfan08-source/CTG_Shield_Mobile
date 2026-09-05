@@ -7,6 +7,8 @@ import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'auth_screen.dart';
 
 class CTGMapScreen extends StatefulWidget {
   const CTGMapScreen({super.key});
@@ -16,6 +18,18 @@ class CTGMapScreen extends StatefulWidget {
 }
 
 class _CTGMapScreenState extends State<CTGMapScreen> {
+  // Use 127.0.0.1 for Chrome, 10.0.2.2 for Android Emulator, or local machine Wi-Fi IP for phone
+ static const String httpBaseUrl = 'https://ctg-shield-backend.onrender.com';
+ static const String wsBaseUrl = 'wss://ctg-shield-backend.onrender.com';
+
+  final FlutterSecureStorage _storage = const FlutterSecureStorage();
+
+  // Active User Profile from Secure Storage
+  String _userId = "user_0";
+  String _userName = "Citizen";
+  String _userPhone = "N/A";
+  String _emergencyContact = "N/A";
+
   LatLng currentLocation = const LatLng(22.3569, 91.8215); // GEC Circle
   final MapController _mapController = MapController();
 
@@ -26,7 +40,6 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
   Map<String, dynamic>? safetyData;
   List<dynamic> incidentMarkersList = [];
   WebSocketChannel? _wsChannel;
-  final String userId = "user_${DateTime.now().millisecondsSinceEpoch % 10000}";
 
   // Audio Player for Siren Alarm
   final AudioPlayer _audioPlayer = AudioPlayer();
@@ -37,9 +50,9 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
   @override
   void initState() {
     super.initState();
+    _loadUserProfileAndConnect();
     evaluateLocationSafety(currentLocation.latitude, currentLocation.longitude);
     fetchRecentIncidents();
-    _initWebSocket();
   }
 
   @override
@@ -49,6 +62,62 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
     _positionStreamSubscription?.cancel();
     _wsChannel?.sink.close();
     super.dispose();
+  }
+
+  Future<void> _loadUserProfileAndConnect() async {
+    final id = await _storage.read(key: 'user_id');
+    final name = await _storage.read(key: 'user_name');
+    final phone = await _storage.read(key: 'user_phone');
+    final contact = await _storage.read(key: 'emergency_contact');
+
+    if (mounted) {
+      setState(() {
+        if (id != null) _userId = id;
+        if (name != null) _userName = name;
+        if (phone != null) _userPhone = phone;
+        if (contact != null) _emergencyContact = contact;
+      });
+    }
+
+    _initWebSocket();
+  }
+
+  Future<void> _logout() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text("Sign Out", style: TextStyle(color: Colors.white)),
+        content: const Text(
+          "Are you sure you want to log out of CTG Shield?",
+          style: TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text("Cancel", style: TextStyle(color: Colors.white60)),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text("Sign Out", style: TextStyle(color: Colors.white)),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm == true) {
+      await _storage.deleteAll();
+      _stopSiren();
+      await _positionStreamSubscription?.cancel();
+      _wsChannel?.sink.close();
+
+      if (!mounted) return;
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(builder: (context) => const AuthScreen()),
+      );
+    }
   }
 
   Future<void> _playSiren() async {
@@ -79,7 +148,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
   void _initWebSocket() {
     try {
       _wsChannel = WebSocketChannel.connect(
-        Uri.parse('wss://ctg-shield-backend.onrender.com/ws/safety-stream/$userId'),
+        Uri.parse('$wsBaseUrl/ws/safety-stream/$_userId'),
       );
       _wsChannel!.stream.listen((message) {
         final alert = json.decode(message);
@@ -96,9 +165,10 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
   void _triggerEmergencySOSOverride(Map<String, dynamic> alert) {
     _playSiren();
 
-    final victimName = alert['victim_name'] ?? 'Citizen in Distress';
+    final victimName = alert['victim_name'] ?? alert['name'] ?? 'Citizen in Distress';
     final emergencyType = alert['emergency_type'] ?? 'PHYSICAL ATTACK';
-    final victimPhone = alert['victim_phone'] ?? '+880 1819-000000';
+    final victimPhone = alert['victim_phone'] ?? alert['contact'] ?? '+880 1819-000000';
+    final emergencyGuardian = alert['emergency_contact'] ?? 'Not Specified';
     final victimLat = (alert['latitude'] as num?)?.toDouble() ?? currentLocation.latitude;
     final victimLon = (alert['longitude'] as num?)?.toDouble() ?? currentLocation.longitude;
 
@@ -174,7 +244,9 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
                         const SizedBox(height: 8),
                         _buildOverrideInfoRow("Incident:", emergencyType, Colors.amberAccent),
                         const SizedBox(height: 8),
-                        _buildOverrideInfoRow("Phone:", victimPhone, Colors.cyanAccent),
+                        _buildOverrideInfoRow("Victim Phone:", victimPhone, Colors.cyanAccent),
+                        const SizedBox(height: 8),
+                        _buildOverrideInfoRow("Guardian Phone:", emergencyGuardian, Colors.orangeAccent),
                         const SizedBox(height: 8),
                         _buildOverrideInfoRow(
                           "Proximity:",
@@ -357,7 +429,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
   }
 
   Future<void> fetchRecentIncidents() async {
-    final url = Uri.parse('https://ctg-shield-backend.onrender.com/api/v1/incidents/recent?limit=50');
+    final url = Uri.parse('$httpBaseUrl/api/v1/incidents/recent?limit=50');
     try {
       final response = await http.get(url);
       if (response.statusCode == 200) {
@@ -376,9 +448,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
       isLoading = true;
     });
 
-    final url = Uri.parse(
-      'https://ctg-shield-backend.onrender.com/api/v1/safety/evaluate-location?lon=$lon&lat=$lat',
-    );
+    final url = Uri.parse('$httpBaseUrl/api/v1/safety/evaluate-location?lon=$lon&lat=$lat');
 
     try {
       final response = await http.get(url);
@@ -630,7 +700,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
             ElevatedButton(
               style: ElevatedButton.styleFrom(backgroundColor: Colors.blueAccent),
               onPressed: () async {
-                final url = Uri.parse('https://ctg-shield-backend.onrender.com/api/v1/incidents/report');
+                final url = Uri.parse('$httpBaseUrl/api/v1/incidents/report');
                 try {
                   final res = await http.post(
                     url,
@@ -639,7 +709,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
                       "incident_type": selectedType,
                       "description": descController.text.isNotEmpty
                           ? descController.text
-                          : "Reported incident",
+                          : "Reported by $_userName",
                       "longitude": currentLocation.longitude,
                       "latitude": currentLocation.latitude,
                     }),
@@ -681,9 +751,9 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
       builder: (ctx) => AlertDialog(
         backgroundColor: const Color(0xFF1E293B),
         title: const Text("⚠️ TRIGGER EMERGENCY SOS?", style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.bold)),
-        content: const Text(
-          "This will broadcast your GPS location to nearby citizens and law enforcement dispatchers.",
-          style: TextStyle(color: Colors.white70),
+        content: Text(
+          "Broadcasting emergency alert as $_userName ($_userPhone). Guardian Contact ($_emergencyContact) will be notified.",
+          style: const TextStyle(color: Colors.white70),
         ),
         actions: [
           TextButton(
@@ -701,11 +771,12 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
 
     if (confirmed != true) return;
 
-    final url = Uri.parse('https://ctg-shield-backend.onrender.com/api/v1/sos/trigger');
+    final url = Uri.parse('$httpBaseUrl/api/v1/sos/trigger');
     final payload = {
-      "user_id": userId,
-      "user_name": "Citizen User",
-      "user_phone": "+880 1819-999999",
+      "user_id": _userId,
+      "user_name": _userName,
+      "user_phone": _userPhone,
+      "emergency_contact": _emergencyContact,
       "longitude": currentLocation.longitude,
       "latitude": currentLocation.latitude,
       "emergency_type": "PHYSICAL ATTACK",
@@ -725,9 +796,10 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
 
         // Launch full-screen override modal and siren directly
         _triggerEmergencySOSOverride({
-          "victim_name": "You (Citizen User)",
+          "victim_name": "You ($_userName)",
           "emergency_type": "PHYSICAL ATTACK",
-          "victim_phone": "+880 1819-999999",
+          "victim_phone": _userPhone,
+          "emergency_contact": _emergencyContact,
           "latitude": currentLocation.latitude,
           "longitude": currentLocation.longitude,
         });
@@ -747,7 +819,13 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('CTG Shield - Live Safety Radar', style: TextStyle(fontWeight: FontWeight.bold)),
+        title: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text('CTG Shield Radar', style: TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+            Text('Active User: $_userName', style: const TextStyle(fontSize: 12, color: Colors.blueGrey)),
+          ],
+        ),
         backgroundColor: const Color(0xFF1E293B),
         actions: [
           // 1. Red Emergency Siren Broadcast Simulator Icon
@@ -759,6 +837,7 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
                 "victim_name": "Rashed Karim (Nearby Citizen)",
                 "emergency_type": "MUGGING IN PROGRESS",
                 "victim_phone": "+880 1711-223344",
+                "emergency_contact": "+880 1819-001122",
                 "latitude": 22.3578,
                 "longitude": 91.8385,
               });
@@ -778,6 +857,12 @@ class _CTGMapScreenState extends State<CTGMapScreen> {
             icon: const Icon(Icons.add_location_alt_outlined, color: Colors.blueAccent),
             tooltip: "Report Incident",
             onPressed: _showReportIncidentDialog,
+          ),
+          // 4. Logout Button
+          IconButton(
+            icon: const Icon(Icons.logout_rounded, color: Colors.white60),
+            tooltip: "Sign Out",
+            onPressed: _logout,
           ),
         ],
       ),
